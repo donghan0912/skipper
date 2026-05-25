@@ -1,0 +1,7 @@
+# Module specific build files
+/build
+/intermediates
+/outputs
+/tmp
+*.iml
+.DS_Store
