@@ -47,10 +47,11 @@ class AdSkipService : AccessibilityService() {
         val packageName = event?.packageName?.toString() ?: ""
         
         if (packageName.isBlank() || 
-            packageName.contains("home") || 
-            packageName.contains("systemui") || 
             packageName == this.packageName
         ) return
+
+        // 核心逻辑：只处理用户开启的应用
+        if (!isPackageEnabled(packageName)) return
 
         if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
             type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
@@ -63,6 +64,12 @@ class AdSkipService : AccessibilityService() {
     }
 
     override fun onInterrupt() {}
+
+    private fun isPackageEnabled(packageName: String): Boolean {
+        val prefs = getSharedPreferences("skipper_config", MODE_PRIVATE)
+        val enabledApps = prefs.getStringSet("enabled_apps", null) ?: return false
+        return enabledApps.contains(packageName)
+    }
 
     private fun tryClickWithRetry(retry: Boolean = true) {
         val rootNode = rootInActiveWindow
