@@ -2,57 +2,119 @@ package com.dh.skipper
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.SharedPreferences
 import android.graphics.Path
 import android.graphics.Rect
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.Toast
 
 class AdSkipService : AccessibilityService() {
 
     companion object {
         private const val TAG = "AdSkipService"
+        private const val PREF_NAME = "skipper_config"
+        private const val KEY_ENABLED_APPS = "enabled_apps"
         private val SKIP_KEYWORDS = listOf("跳过", "跳过广告", "Skip", "Skip Ad")
         
         // 【严格匹配】不再允许纯数字。必须包含 s、秒 或 跳过。
         private val COUNTDOWN_PATTERN = Regex("(?i)^(\\d+\\s*[sS秒]|跳过\\s*\\d+|\\d+\\s*跳过)$")
         
         private const val RETRY_DELAY = 400L
-        private const val CLICK_COOLDOWN = 2500L 
+        private const val CLICK_COOLDOWN = 2500L
         private const val SAME_NODE_COOLDOWN = 15000L 
-        private const val MAX_TEXT_LENGTH = 10 
+        private const val MAX_TEXT_LENGTH = 10
         private const val SCAN_INTERVAL = 400L // 两次扫描之间的最小时间间隔，防止高频触发导致卡顿
+        private const val WINDOW_TIMEOUT = 5000L // 窗口过期时间 (5秒内处理启动广告)
     }
 
     private val handler = Handler(Looper.getMainLooper())
     private var lastClickTime = 0L
     private var lastScanTime = 0L
     private var lastClickNodeTag = ""
+    private var currentPackage = ""
+    private var packageStartTime = 0L
+    
+    // 页面指纹管理器
+    private val fingerprintManager = PageFingerprintManager()
+    
+    // 缓存所有要处理的 APP 页面路径 (包名)
+    private var enabledAppPages = mutableSetOf<String>()
+    
+    // 监听配置变化
+    private val prefsListener = SharedPreferences.OnSharedPreferenceChangeListener { prefs, key ->
+        if (key == KEY_ENABLED_APPS) {
+            refreshPageCache(prefs)
+        }
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Log.d(TAG, "Service Connected - High Performance Mode Enabled")
+        
+        val prefs = getSharedPreferences(PREF_NAME, MODE_PRIVATE)
+        refreshPageCache(prefs)
+        prefs.registerOnSharedPreferenceChangeListener(prefsListener)
+        
+        Logger.d(TAG, "Service Connected - Cache Initialized: ${enabledAppPages.size} apps")
+
+
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        getSharedPreferences(PREF_NAME, MODE_PRIVATE).unregisterOnSharedPreferenceChangeListener(prefsListener)
+    }
+
+    private fun manualCapture() {
+        val root = rootInActiveWindow
+        if (root == null) {
+            Toast.makeText(this, "无法获取当前页面内容", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val packageName = root.packageName?.toString() ?: ""
+        val fingerprint = fingerprintManager.calculateFingerprint(root)
+        
+        // 尝试在该页面中寻找“跳过”按钮
+        val skipNode = findSkipNode(root)
+        
+        if (skipNode != null) {
+            fingerprintManager.recordFingerprint(packageName, fingerprint, skipNode)
+            Toast.makeText(this, "采集成功！\n应用：$packageName\n指纹：$fingerprint", Toast.LENGTH_LONG).show()
+            skipNode.recycle()
+        } else {
+            Toast.makeText(this, "未在该页面检测到‘跳过’按钮", Toast.LENGTH_SHORT).show()
+        }
+        root.recycle()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val currentTime = System.currentTimeMillis()
-        
-        // 1. 节流优化：如果距离上次扫描不足 SCAN_INTERVAL，直接忽略。
-        // 这能极大地减轻在有动画的页面（如进度条、视频播放）时的 CPU 负载。
-        if (currentTime - lastScanTime < SCAN_INTERVAL) return
-        
-        val type = event?.eventType
         val packageName = event?.packageName?.toString() ?: ""
         
-        if (packageName.isBlank() || 
-            packageName == this.packageName
-        ) return
+        if (packageName.isBlank() || packageName == this.packageName) return
 
-        // 核心逻辑：只处理用户开启的应用
+        // 1. 检测应用切换，重置窗口计时
+        if (packageName != currentPackage) {
+            currentPackage = packageName
+            packageStartTime = currentTime
+            Logger.d(TAG, ">>> 进入应用: $packageName, 重置 5s 窗口")
+        }
+
+        // 2. 核心逻辑：只在窗口期内运行
+        if (currentTime - packageStartTime > WINDOW_TIMEOUT) {
+            // 超过 5 秒，不再扫描
+            return
+        }
+
+        if (currentTime - lastScanTime < SCAN_INTERVAL) return
+
+        // 核心逻辑：从缓存中匹配已开启的应用
         if (!isPackageEnabled(packageName)) return
 
+        val type = event?.eventType
         if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
             type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
         ) {
@@ -66,19 +128,51 @@ class AdSkipService : AccessibilityService() {
     override fun onInterrupt() {}
 
     private fun isPackageEnabled(packageName: String): Boolean {
-        val prefs = getSharedPreferences("skipper_config", MODE_PRIVATE)
-        val enabledApps = prefs.getStringSet("enabled_apps", null) ?: return false
-        return enabledApps.contains(packageName)
+        return enabledAppPages.contains(packageName)
+    }
+
+    private fun refreshPageCache(prefs: SharedPreferences) {
+        val apps = prefs.getStringSet(KEY_ENABLED_APPS, null)
+        enabledAppPages = apps?.toMutableSet() ?: mutableSetOf()
+        Logger.d(TAG, "Page cache refreshed: $enabledAppPages")
     }
 
     private fun tryClickWithRetry(retry: Boolean = true) {
-        val rootNode = rootInActiveWindow
-        if (rootNode != null && processNode(rootNode)) return
+        val rootNode = rootInActiveWindow ?: return
+        
+        val packageName = rootNode.packageName?.toString() ?: ""
+        val fingerprint = fingerprintManager.calculateFingerprint(rootNode)
+        
+        // 1. 优先尝试匹配指纹缓存
+        val cachedAction = fingerprintManager.getMatchedAction(packageName, fingerprint)
+        if (cachedAction != null) {
+            if (performActionClick(rootNode, cachedAction)) {
+                Logger.i(TAG, ">>> [命中缓存] 秒跳成功: $packageName")
+                rootNode.recycle()
+                return
+            }
+        }
+
+        // 2. 核心策略：如果该应用已经有录制过的指纹，但当前页面没匹配上
+        // 说明当前页面很大可能不是广告启动页，直接停止扫描，保护性能。
+        if (fingerprintManager.hasRegisteredFingerprint(packageName)) {
+            // Logger.d(TAG, "该应用已有缓存记录，跳过非指纹页面扫描")
+            rootNode.recycle()
+            return
+        }
+
+        // 3. 学习模式：如果还没录制过该应用的指纹，执行全量扫描
+        if (processNode(rootNode, fingerprint)) {
+            // rootNode 会在 processNode 中 recycle
+            return
+        }
 
         val windows = windows
         for (window in windows) {
             val windowRoot = window.root
-            if (windowRoot != null && processNode(windowRoot)) return
+            if (windowRoot != null) {
+                if (processNode(windowRoot, fingerprint)) return
+            }
         }
 
         if (retry) {
@@ -87,13 +181,48 @@ class AdSkipService : AccessibilityService() {
         }
     }
 
-    private fun processNode(root: AccessibilityNodeInfo): Boolean {
+    /**
+     * 根据指纹缓存的动作执行快速点击
+     */
+    private fun performActionClick(root: AccessibilityNodeInfo, action: PageFingerprintManager.TargetAction): Boolean {
+        // 优先使用 ID 查找
+        if (!action.viewId.isNullOrBlank()) {
+            val nodes = root.findAccessibilityNodeInfosByViewId(action.viewId)
+            for (node in nodes) {
+                if (isSkipNode(node) && performClick(node)) {
+                    // 注意：performClick 内部没有 recycle node，需要这里处理
+                    node.recycle()
+                    return true
+                }
+                node.recycle()
+            }
+        }
+        // 其次使用 Text 查找
+        if (!action.text.isNullOrBlank()) {
+            val nodes = root.findAccessibilityNodeInfosByText(action.text)
+            for (node in nodes) {
+                if (isSkipNode(node) && performClick(node)) {
+                    node.recycle()
+                    return true
+                }
+                node.recycle()
+            }
+        }
+        return false
+    }
+
+    private fun processNode(root: AccessibilityNodeInfo, fingerprint: String = ""): Boolean {
         val foundNode = findSkipNode(root)
         if (foundNode != null) {
             val tag = "${foundNode.packageName}:${foundNode.viewIdResourceName}:${foundNode.text}"
             
+            // 扫描成功，记录指纹
+            if (fingerprint.isNotBlank()) {
+                fingerprintManager.recordFingerprint(foundNode.packageName?.toString() ?: "", fingerprint, foundNode)
+            }
+
             if (performClick(foundNode)) {
-                Log.i(TAG, ">>> SUCCESS: Clicked on $tag")
+                Logger.i(TAG, ">>> SUCCESS: Clicked on $tag")
                 lastClickTime = System.currentTimeMillis()
                 lastClickNodeTag = tag
                 foundNode.recycle()
@@ -164,7 +293,7 @@ class AdSkipService : AccessibilityService() {
                      (idName.isNotBlank() && idName.contains("skip", true))
 
         if (isMatch) {
-            Log.d(TAG, "Match Found! Text: $text, Desc: $desc, ID: $viewId")
+            Logger.d(TAG, "Match Found! Text: $text, Desc: $desc, ID: $viewId")
         }
 
         return isMatch
@@ -185,7 +314,7 @@ class AdSkipService : AccessibilityService() {
                 .build()
             
             if (dispatchGesture(gesture, null, null)) {
-                Log.d(TAG, "Dispatched gesture click at ($x, $y)")
+                Logger.d(TAG, "Dispatched gesture click at ($x, $y)")
                 return true
             }
         }

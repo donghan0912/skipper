@@ -2,8 +2,6 @@ package com.dh.skipper
 
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ApplicationInfo
-import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
 import android.os.Bundle
 import android.provider.Settings
@@ -49,6 +47,8 @@ class MainActivity : AppCompatActivity() {
         val btnToggle = findViewById<Button>(R.id.btnToggle)
         val rvApps = findViewById<RecyclerView>(R.id.rvApps)
         val etSearch = findViewById<EditText>(R.id.etSearch)
+
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
         btnToggle.setOnClickListener {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
