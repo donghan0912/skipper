@@ -38,7 +38,7 @@ class AdSkipService : AccessibilityService() {
     private var packageStartTime = 0L
     
     // 页面指纹管理器
-    private val fingerprintManager = PageFingerprintManager()
+    private lateinit var fingerprintManager: PageFingerprintManager
     
     // 缓存所有要处理的 APP 页面路径 (包名)
     private var enabledAppPages = mutableSetOf<String>()
@@ -52,7 +52,9 @@ class AdSkipService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        
+
+        fingerprintManager = PageFingerprintManager(this)
+
         val prefs = getSharedPreferences(PREF_NAME, MODE_PRIVATE)
         refreshPageCache(prefs)
         prefs.registerOnSharedPreferenceChangeListener(prefsListener)
@@ -65,29 +67,6 @@ class AdSkipService : AccessibilityService() {
     override fun onDestroy() {
         super.onDestroy()
         getSharedPreferences(PREF_NAME, MODE_PRIVATE).unregisterOnSharedPreferenceChangeListener(prefsListener)
-    }
-
-    private fun manualCapture() {
-        val root = rootInActiveWindow
-        if (root == null) {
-            Toast.makeText(this, "无法获取当前页面内容", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        val packageName = root.packageName?.toString() ?: ""
-        val fingerprint = fingerprintManager.calculateFingerprint(root)
-        
-        // 尝试在该页面中寻找“跳过”按钮
-        val skipNode = findSkipNode(root)
-        
-        if (skipNode != null) {
-            fingerprintManager.recordFingerprint(packageName, fingerprint, skipNode)
-            Toast.makeText(this, "采集成功！\n应用：$packageName\n指纹：$fingerprint", Toast.LENGTH_LONG).show()
-            skipNode.recycle()
-        } else {
-            Toast.makeText(this, "未在该页面检测到‘跳过’按钮", Toast.LENGTH_SHORT).show()
-        }
-        root.recycle()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -153,15 +132,8 @@ class AdSkipService : AccessibilityService() {
             }
         }
 
-        // 2. 核心策略：如果该应用已经有录制过的指纹，但当前页面没匹配上
-        // 说明当前页面很大可能不是广告启动页，直接停止扫描，保护性能。
-        if (fingerprintManager.hasRegisteredFingerprint(packageName)) {
-            // Logger.d(TAG, "该应用已有缓存记录，跳过非指纹页面扫描")
-            rootNode.recycle()
-            return
-        }
-
-        // 3. 学习模式：如果还没录制过该应用的指纹，执行全量扫描
+        // 2. 缓存未命中，走全量扫描（学习模式）
+        //    发现新的跳过按钮会追加新指纹，一个 app 可以有多条指纹
         if (processNode(rootNode, fingerprint)) {
             // rootNode 会在 processNode 中 recycle
             return
